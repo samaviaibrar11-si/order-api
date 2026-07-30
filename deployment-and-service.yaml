@@ -1,0 +1,119 @@
+# Remediated manifests for orders-api
+#
+# Fixes applied (see incident_analysis.md for root-cause detail):
+#   1. Service targetPort corrected to 8080 to match the actual container/app port.
+#   2. Probes corrected to match the documented contract:
+#        readinessProbe -> /ready  (dependency-aware; keeps pod out of Service until DB is warm)
+#        livenessProbe  -> /live   (process-only; won't kill the process for a slow dependency)
+#      Added a startupProbe so a slow Postgres warm-up gets extra grace before liveness
+#      even begins counting failures.
+#   3. Resources resized based on observed usage (up to ~176Mi RSS) with headroom.
+#   4. Rollout strategy changed to maxSurge=1 / maxUnavailable=0 so replacement pods must be
+#      Ready before any old pod is removed -- protects the 99.95% availability target.
+#      A PodDisruptionBudget is added for the same reason (protects against unrelated
+#      node drains/evictions during the incident window).
+#   5. Plaintext DB credential removed from the manifest; sourced from a Secret instead.
+#      NOTE: this file intentionally does NOT contain a real secret. It documents the
+#      expected Secret name/key only. Create the real Secret out-of-band, e.g.:
+#        kubectl -n production create secret generic orders-api-db-credentials \
+#          --from-literal=database-url='postgres://orders_user:<REDACTED>@orders-db:5432/orders'
+#      or via an external-secrets/Sealed Secrets pipeline -- do not commit real values.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders-api
+  namespace: production
+spec:
+  selector:
+    app: orders-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http   # matches the named containerPort below; avoids future port drift
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: orders-api
+  namespace: production
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: orders-api
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+  namespace: production
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # never drop below 3 Ready pods during a rollout
+      maxSurge: 1         # bring up 1 extra pod, wait for it to be Ready, then retire an old one
+  selector:
+    matchLabels:
+      app: orders-api
+  template:
+    metadata:
+      labels:
+        app: orders-api
+    spec:
+      containers:
+        - name: orders-api
+          image: registry.example.com/orders-api:1.9.0
+          ports:
+            - name: http
+              containerPort: 8080   # confirmed by app log "listening on 0.0.0.0:8080"
+
+          # Gives the container up to 30s (6 * 5s) to become ready on first start,
+          # e.g. while Postgres is warming up, before liveness starts evaluating at all.
+          startupProbe:
+            httpGet:
+              path: /live
+              port: http
+            failureThreshold: 6
+            periodSeconds: 5
+
+          readinessProbe:
+            httpGet:
+              path: /ready          # dependency-aware; correct per app contract
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+            timeoutSeconds: 2
+
+          livenessProbe:
+            httpGet:
+              path: /live            # process-only; must NOT depend on Postgres
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10         # slower cadence; liveness should be conservative
+            failureThreshold: 3
+            timeoutSeconds: 2
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: 250m
+              memory: 320Mi
+            # Sizing rationale: observed RSS reached ~176Mi on a stable pod and 127Mi on
+            # pods that were still starting up / under load. 320Mi gives ~80% headroom
+            # over the highest observed sample. Re-tune after a soak test (see runbook.md)
+            # rather than treating these numbers as final.
+
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: orders-api-db-credentials   # expected Secret, created out-of-band
+                  key: database-url                 # expected key; no value embedded here
